@@ -1,0 +1,526 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec  3 14:45:41 2018
+
+@author: W.Wojnowski
+"""
+import gdal
+import numpy as np
+import pandas as pd
+import os
+from matplotlib import pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+import pickle
+import fnmatch
+#from keras.models import Sequential
+#from keras.layers import Dense
+'''
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+                Functions
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+'''
+# Modified function with redundancies removed. Returns a 3d np array:
+def Gdal_read_image(path):
+    global rows,cols,bands,GeoTransform,Projection
+    img=gdal.Open(path)
+    if img==None:
+            print ('Image Open failed!')
+    cols =img.RasterXSize
+    rows =img.RasterYSize
+    bands=img.RasterCount
+    print (cols,rows,bands)
+    img_array=np.zeros((rows,cols,bands))
+    for band in range(0,bands):
+        img_band=img.GetRasterBand(band+1)
+        img_array[:,:,band] = img_band.ReadAsArray(0, 0, cols, rows)
+    GeoTransform=img.GetGeoTransform()
+    Projection=img.GetProjection()
+    return img_array
+
+# Modified function with redundancies removed. Saves a .tif image that is the shape of the array:
+def Save_Img_tif(tif_path, Array):
+    dr = gdal.GetDriverByName("GTiff")
+    print (len(Array.shape))
+    if len(Array.shape)>2:
+        outDs = dr.Create(tif_path, Array.shape[1], Array.shape[0],Array.shape[2])
+        for i in range(0,Array.shape[2]):
+            outDs.GetRasterBand(i+1).WriteArray( Array[:,:,i] )
+
+    else:
+        outDs = dr.Create(tif_path, Array.shape[1], Array.shape[0],1)
+        outDs.GetRasterBand(1).WriteArray( Array )
+        outDs.FlushCache()
+    outDs = None
+
+# Save .csv for external use, archiving:
+def Save_csv(DataFrame, filename):
+    print('Saving... (this might take a while)')
+    DataFrame.to_csv(filename + '.csv')
+    print('Saved.')
+
+# Create a concatenated DataFrame for machine learning by reading a directory with HSI and directory with classified images:
+def Read_HSI(HSI_dir, targets_dir):
+    HSI = os.listdir(HSI_dir)
+    column_names = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14', 'B15', 'B16', 'B17', 'B18', 'B19', 'B20', 'B21', 'B22', 'B23', 'B24', 'B25', 'B26', 'B27', 'B28', 'B29', 'B30', 'B31', 'B32', 'B33', 'B34', 'B35', 'B36', 'B37', 'B38', 'B39', 'B40', 'B41', 'B42', 'B43', 'B44', 'B45', 'B46', 'B47', 'B48', 'B49', 'B50']    
+    df = pd.DataFrame()
+    for i in HSI:
+        print (i)
+        x = Gdal_read_image(HSI_dir + '/' + i)
+        xtransp = np.reshape(x, (6400, 50))
+        dfX = pd.DataFrame(data=xtransp, columns=column_names)              
+        y = Gdal_read_image(targets_dir + '/' + i)
+        ytransp = np.reshape(y, (6400, 1))
+        dfY = pd.DataFrame(data=ytransp, columns=['Target'])
+        dfI = pd.concat([dfX, dfY], axis=1)
+        df = df.append(dfI, ignore_index=True)
+        print ('read: ' + i)
+    return df
+
+# Reads a single hyperspectral image and returns a pandas DataFrame: 
+def Read_single_HSI(image):
+    column_names = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14', 'B15', 'B16', 'B17', 'B18', 'B19', 'B20', 'B21', 'B22', 'B23', 'B24', 'B25', 'B26', 'B27', 'B28', 'B29', 'B30', 'B31', 'B32', 'B33', 'B34', 'B35', 'B36', 'B37', 'B38', 'B39', 'B40', 'B41', 'B42', 'B43', 'B44', 'B45', 'B46', 'B47', 'B48', 'B49', 'B50']
+    x = Gdal_read_image(image)
+    xtransp = np.reshape(x, (6400, 50))
+    dfX = pd.DataFrame(data=xtransp, columns=column_names) 
+    return dfX
+
+# Reads a single classified image and returns a pandas DataFrame:
+def Read_single_ref(image):
+    y = Gdal_read_image(image)
+    ytransp = np.reshape(y, (6400, 1))
+    dfY = pd.DataFrame(data=ytransp, columns=['Target'])
+    return dfY
+
+# Generate a .tif image based on the classified data:
+# Remember to select only the column with classification results!
+def Generate_class_img(class_data_path):
+    y = Gdal_read_image(class_data_path)
+    y_transp = np.reshape(y, (6400, 1))
+    dfY = pd.DataFrame(data=y_transp, columns=['Target'])
+    # Add RGB channels:
+    dfY['R'] = np.NaN
+    dfY['G'] = np.NaN
+    dfY['B'] = np.NaN
+    # This is much faster than a for loop:
+    # 0.0 - unclassified (0 0 0); 
+    # 1.0 - sunlit ground (255 255 255;
+    # 2.0 - shaded leaves (255 192 160);
+    # 3.0 - sunlit leaves (87 255 128);
+    # 4.0 - shaded ground (128 128 128)
+    conditions = [(dfY['Target'] == 0.0),
+                  (dfY['Target'] == 1.0),
+                  (dfY['Target'] == 2.0),
+                  (dfY['Target'] == 3.0),
+                  (dfY['Target'] == 4.0)]
+    choicesR = [0, 255, 255, 87, 128]
+    choicesG = [0, 255, 192, 255, 128]
+    choicesB = [0, 255, 160, 128, 128]
+    dfY['R'] = np.select(conditions, choicesR)
+    dfY['G'] = np.select(conditions, choicesG)
+    dfY['B'] = np.select(conditions, choicesB)
+               
+    dfRGB = dfY[['R', 'G', 'B']]
+    numpyRGB = dfRGB.values
+    imageRGB = np.reshape(numpyRGB, (80, 80, 3))
+    # Show a preview:
+    plt.imshow(imageRGB, interpolation='nearest')
+    plt.show()
+    return imageRGB
+
+# Read the output of Orange classification saved as .csv and turn it to a pd DataFrame. This assumes that the classification result was re-labeled "Target" in Orange:
+def Orng_classified(csv_path):
+    dfOrng = pd.read_csv(csv_path)
+    # Drop first two rows and a column containing redundant information form Orange:
+    dfOrng = dfOrng.iloc[2:].reset_index(drop = True)
+    dfOrng = dfOrng.drop(columns=['Selected'], axis=1)
+    # Change the 'Target' type from object to float:
+    dfOrng['Target'] = pd.to_numeric(dfOrng['Target'], downcast='float')
+    return dfOrng
+
+# Generate RGB image from a DataFrame:
+def Generate_class_img_df(df):
+    # Add RGB channels:
+    df['R'] = np.NaN
+    df['G'] = np.NaN
+    df['B'] = np.NaN   
+    # This is much faster than a for loop:
+    # 0.0 - unclassified (0 0 0); 
+    # 1.0 - sunlit ground (255 255 255;
+    # 2.0 - shaded leaves (255 192 160);
+    # 3.0 - sunlit leaves (87 255 128);
+    # 4.0 - shaded ground (128 128 128)     
+    conditions = [(df['Target'] == 0.0),
+                  (df['Target'] == 1.0),
+                  (df['Target'] == 2.0),
+                  (df['Target'] == 3.0),
+                  (df['Target'] == 4.0)]
+    choicesR = [0, 255, 255, 87, 128]
+    choicesG = [0, 255, 192, 255, 128]
+    choicesB = [0, 255, 160, 128, 128]
+    df['R'] = np.select(conditions, choicesR)
+    df['G'] = np.select(conditions, choicesG)
+    df['B'] = np.select(conditions, choicesB)
+                   
+    dfRGB = df[['R', 'G', 'B']]
+    numpyRGB = dfRGB.values
+    imageRGB = np.reshape(numpyRGB, (80, 80, 3))
+    # Show a preview:
+    plt.imshow(imageRGB, interpolation='nearest')
+    plt.show()
+    return imageRGB
+
+# Train the random forest classifier on manually clasified HSI:
+def RF_Train_Random_Forest(df):
+    print ('RF training...')
+    # Set random seed
+    np.random.seed(0)
+    # Create a list of the feature column's names
+    features = df.columns[1:51]
+    y = df['Target']
+    # Create a random forest Classifier. By convention, clf means 'Classifier'
+    clf = RandomForestClassifier(n_jobs=2, random_state=0, n_estimators=100, min_samples_split=5)
+    # Train the Classifier to take the training features and learn how they relate to the training y
+    model = clf.fit(df[features], y)
+    print ('done')
+    # View a list of the features and their importance scores
+    print('Feature importances:')
+    print (list(zip(df[features], clf.feature_importances_)))
+    return model
+ 
+# Classify HSI using random forest:
+def RF_Predict_features(df, clf):
+    print ('RF predicting...')
+    # Apply the trained Classifier to the test data
+    features = df.columns[1:51]
+    predictions = clf.predict(df[features])
+    dfP = pd.DataFrame(predictions, columns=['Target'])
+    print ('done')
+    return dfP
+
+# Classify HSI using random forest (for scripted classification):
+def RF_Predict_features_auto(df, clf):
+    print ('RF predicting...')
+    # Apply the trained Classifier to the test data
+    features = df.columns[:51]
+    predictions = clf.predict(df[features])
+    dfP = pd.DataFrame(predictions, columns=['Target'])
+    print ('done')
+    return dfP
+
+# Read the HSI in a specified folder, classify them using RF and output
+# the classification images to a different folder:
+def Classify_folder_RF(Training_csv, HSI_dir, out_dir):
+    # Read the directory containing hyperspectral images:
+    HSI = os.listdir(HSI_dir)
+    # Training set:
+    dfT = pd.read_csv(Training_csv)
+    # Train the RF classifier:
+    RFmodel = RF_Train_Random_Forest(dfT)
+    print ('Training done.')
+    # Classify each hyperspectral image in a folder and 
+    print ('Classifying...')
+    for img in HSI:
+        dfX = Read_single_HSI(HSI_dir + '/' + img)
+        dfP = RF_Predict_features_auto(dfX, RFmodel)
+        imgRF = Generate_class_img_df(dfP)
+        Save_Img_tif(out_dir + '/' + img + '_classified.tif', imgRF)
+        print ('Saved ' + img + '.tif')
+    print ('Classification finished.')
+    
+# Train the ANN classifier on manually clasified HSI:
+def ANN_Train_Neural_Network(df):
+    mlp = MLPClassifier(activation='relu', alpha=0.0001, batch_size='auto', beta_1=0.9, beta_2=0.999, early_stopping=False, epsilon=1e-08, hidden_layer_sizes=(32, 32, 32), learning_rate='constant',        learning_rate_init=0.001, max_iter=1000, momentum=0.9, nesterovs_momentum=True, power_t=0.5, random_state=None, shuffle=True, solver='adam', tol=0.0001, validation_fraction=0.1, verbose=False, warm_start=False)
+    
+    features = df.columns[1:51]
+    x = df[features]
+    y = df['Target']
+    print ('Training...')
+    model = mlp.fit(x, y)
+    plt.ylabel('cost')
+    plt.xlabel('iterations')
+    plt.plot(mlp.loss_curve_)
+    plt.show()
+    return model
+
+# Classify HSI using ANN:
+def ANN_Predict_Features_auto(df, model):    
+    print ('ANN predicting...')
+    features = df.columns[:51]
+    predictions = model.predict(df[features])
+    dfP = pd.DataFrame(predictions, columns=['Target'])
+    print ('done')
+    return dfP
+ 
+# Read the HSI in a specified folder, classify them using ANN and output
+# the classification images to a different folder:       
+def Classify_folder_ANN(Training_csv, HSI_dir, out_dir):
+    # Read the directory containing hyperspectral images:
+    HSI = os.listdir(HSI_dir)
+    # Training set:
+    dfT = pd.read_csv(Training_csv)
+    # Train the ANN classifier:
+    ANNmodel = ANN_Train_Neural_Network(dfT)
+    print ('Training done.')
+    # Classify each hyperspectral image in a folder and 
+    print ('Classifying...')
+    for img in HSI:
+        dfX = Read_single_HSI(HSI_dir + '/' + img)
+        dfP = ANN_Predict_Features_auto(dfX, ANNmodel)
+        imgANN = Generate_class_img_df(dfP)
+        Save_Img_tif(out_dir + '/' + img + '_classified.tif', imgANN)
+        print ('Saved ' + img + '.tif')
+    print ('Classification finished.')
+        
+# Combine HSI with different chlorophyl content with single classified images.
+# The names of the files have to end with '_*_Hyperspectral_Images.tif'.
+# To automatically anotate an entire folder containing numerous trees, use the 'Combine_folders' function.
+def Combine_Trees(HSI_dir, targets_dir):
+    HSI = os.listdir(HSI_dir)
+    targets = os.listdir(targets_dir)
+    df = pd.DataFrame()
+    for i in HSI:
+        if i.endswith('_0_Hyperspectral_Images.tif'):
+            for j in targets:
+                if j.endswith('_0_Hyperspectral_Images.tif'):
+                    dfX = Read_single_HSI(HSI_dir + '/' + i)
+                    dfY = Read_single_ref(targets_dir + '/' + j)
+                    dfZ = pd.concat([dfX, dfY], axis=1)
+                    df = df.append(dfZ, ignore_index=True)                    
+        elif i.endswith('_20_Hyperspectral_Images.tif'):
+            for j in targets:
+                if j.endswith('_20_Hyperspectral_Images.tif'):
+                    dfX = Read_single_HSI(HSI_dir + '/' + i)
+                    dfY = Read_single_ref(targets_dir + '/' + j)
+                    dfZ = pd.concat([dfX, dfY], axis=1)
+                    df = df.append(dfZ, ignore_index=True)
+        elif i.endswith('_40_Hyperspectral_Images.tif'):            
+            for j in targets:
+                if j.endswith('_40_Hyperspectral_Images.tif'):
+                    dfX = Read_single_HSI(HSI_dir + '/' + i)
+                    dfY = Read_single_ref(targets_dir + '/' + j)
+                    dfZ = pd.concat([dfX, dfY], axis=1)
+                    df = df.append(dfZ, ignore_index=True)
+        elif i.endswith('_60_Hyperspectral_Images.tif'):            
+            for j in targets:
+                if j.endswith('_60_Hyperspectral_Images.tif'):
+                    dfX = Read_single_HSI(HSI_dir + '/' + i)
+                    dfY = Read_single_ref(targets_dir + '/' + j)
+                    dfZ = pd.concat([dfX, dfY], axis=1)
+                    df = df.append(dfZ, ignore_index=True)
+        elif i.endswith('_80_Hyperspectral_Images.tif'):            
+            for j in targets:
+                if j.endswith('_80_Hyperspectral_Images.tif'):
+                    dfX = Read_single_HSI(HSI_dir + '/' + i)
+                    dfY = Read_single_ref(targets_dir + '/' + j)
+                    dfZ = pd.concat([dfX, dfY], axis=1)
+                    df = df.append(dfZ, ignore_index=True)
+        else:            
+            for j in targets:
+                if j.endswith('_100_Hyperspectral_Images.tif'):
+                    dfX = Read_single_HSI(HSI_dir + '/' + i)
+                    dfY = Read_single_ref(targets_dir + '/' + j)
+                    dfZ = pd.concat([dfX, dfY], axis=1)
+                    df = df.append(dfZ, ignore_index=True)
+                    
+    return df
+    
+# Combine folder containing subfolderes with HSI for different trees with a varying chlorophyll content 
+# with corresponding classified images from another folder. The folders containing the classified images
+# have to be named like the folders with HSI images + '_classified". E.g.: 'Tabebuia_rosea01adult_wet_early' for HSI and 'Tabebuia_rosea01adult_wet_early_classified' for classified images.
+def Combine_folders(HSI_folder_dir, targets_folder_dir):
+    HSI_folder = os.listdir(HSI_folder_dir)
+    targets_folder = os.listdir(targets_folder_dir)
+    df = pd.DataFrame()
+    for i in HSI_folder:
+        for j in targets_folder:
+            if j == (i + '_classified'):
+                dfA = Combine_Trees((HSI_folder_dir + '/' + i), (targets_folder_dir + '/' + j))
+                df = df.append(dfA, ignore_index=True)
+    return df
+#Example of use:
+#HSI_folder_dir = 'F:/Trees_classification/Individual_trees'
+#targets_folder_dir = 'F:/Trees_classification/Individual_trees_classified'
+#dfB = Combine_folders(HSI_folder_dir, targets_folder_dir)
+#print (dfB)
+#Save_csv(dfB, 'all_data_combined')
+    
+# Save trained ML model:
+def Save_model(model, save_name):
+    filename = (save_name + '.sav')
+    pickle.dump(model, open(filename, 'wb'))
+    print (filename + ' saved')
+
+# Load trained ML model:
+def Load_model(saved_model):    
+    model = pickle.load(open(saved_model, 'rb'))
+    print (saved_model + ' opened')
+    return model
+
+# Randomly select a number of files from each directory for testing. 
+# Warning! The files will be removed from the original folder (training folder)!
+# Warning! Files in the target directory might be overwritten!
+def Select_rndm_test_files(path_training, path_testing, no_files):
+    import os, random, shutil
+#    path_training = 'F:/Trees_classification/Trees_training/'
+#    path_testing = 'F:/Trees_classification/Trees_testing/'
+    random.seed();
+    for i in os.listdir(path_training):
+        filenames = random.sample((os.listdir(path_training +i)), int(no_files))
+        os.makedirs(path_testing + i)
+        for file in filenames:        
+            shutil.move(path_training + i + '/' + file, path_testing + i + '/' + file)
+            print ('moving ' + file)
+
+# This function prints and plots the confusion matrix; normalization can be applied by setting 'normalize=True'.
+def plot_confusion_matrix(model, HSI, target, normalize=False, title='Confusion matrix', cmap=plt.cm.Blues):
+   
+    from sklearn.metrics import confusion_matrix
+    
+    dfA = Read_single_HSI(HSI)
+    dfB = ANN_Predict_Features_auto(dfA, model)
+    dfC = pd.DataFrame(dfB['Target'])
+    dfC.columns = ['Predicted']
+    dfY = Read_single_ref(target)
+    dfZ = pd.concat([dfC, dfY], axis=1)
+    classes = [0, 1, 2, 3, 4]
+    cm = confusion_matrix(dfZ['Target'], dfZ['Predicted'], classes)
+    import itertools
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        print("Normalized confusion matrix")
+    else:
+        print('Confusion matrix, without normalization')
+    plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+#    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45)
+    plt.yticks(tick_marks, classes)
+
+    fmt = '.2f' if normalize else 'd'
+    thresh = cm.max() / 2.
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        plt.text(j, i, format(cm[i, j], fmt),
+                 horizontalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black")
+
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.tight_layout()
+    plt.show()
+    
+# Generate a  normalized confusion matrix for a given tree at a given SKYL.
+# SKYL is an array, e.g. [20], or [0, 20, 40, 60, 80, 100].
+def Print_confusion_matrix(HSI_dir, targets_dir, model, SKYL):
+    for i in os.listdir(HSI_dir):
+        for k in SKYL:
+            if i.endswith('_' + str(k) + '_Hyperspectral_Images.tif'):
+                for j in os.listdir(targets_dir):
+                    if j.endswith('_' +str(k) +'_Hyperspectral_Images.tif'):
+                        plot_confusion_matrix(model, (HSI_dir + i), (targets_dir + j), normalize=True, title=i)
+                        print ('Manually classified:')
+                        Generate_class_img(targets_dir + j)
+                        dfA = Read_single_HSI(HSI_dir + i)
+                        dfB = ANN_Predict_Features_auto(dfA, model)
+                        print ('Automatically classified:')
+                        Generate_class_img_df(dfB)
+
+'''
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+                Script
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+'''
+
+# Create a dataframe of classified HSI in a given folder with a given CAB.
+def Combine_CAB(HSI_dir, targets_dir, CAB):
+    HSI = os.listdir(HSI_dir)
+    targets = os.listdir(targets_dir) 
+    df = pd.DataFrame()
+    for i in HSI:
+        if fnmatch.fnmatch(i, '*Cab_' + str(CAB) + '*'):
+            if i.endswith('_0_Hyperspectral_Images.tif'):
+                for j in targets:
+                    if j.endswith('_0_Hyperspectral_Images.tif'):
+                        dfX = Read_single_HSI(HSI_dir + '/' + i)
+                        dfY = Read_single_ref(targets_dir + '/' + j)
+                        dfZ = pd.concat([dfX, dfY], axis=1)
+                        df = df.append(dfZ, ignore_index=True)                    
+            elif i.endswith('_20_Hyperspectral_Images.tif'):
+                for j in targets:
+                    if j.endswith('_20_Hyperspectral_Images.tif'):
+                        dfX = Read_single_HSI(HSI_dir + '/' + i)
+                        dfY = Read_single_ref(targets_dir + '/' + j)
+                        dfZ = pd.concat([dfX, dfY], axis=1)
+                        df = df.append(dfZ, ignore_index=True)
+            elif i.endswith('_40_Hyperspectral_Images.tif'):            
+                for j in targets:
+                    if j.endswith('_40_Hyperspectral_Images.tif'):
+                        dfX = Read_single_HSI(HSI_dir + '/' + i)
+                        dfY = Read_single_ref(targets_dir + '/' + j)
+                        dfZ = pd.concat([dfX, dfY], axis=1)
+                        df = df.append(dfZ, ignore_index=True)
+            elif i.endswith('_60_Hyperspectral_Images.tif'):            
+                for j in targets:
+                    if j.endswith('_60_Hyperspectral_Images.tif'):
+                        dfX = Read_single_HSI(HSI_dir + '/' + i)
+                        dfY = Read_single_ref(targets_dir + '/' + j)
+                        dfZ = pd.concat([dfX, dfY], axis=1)
+                        df = df.append(dfZ, ignore_index=True)
+            elif i.endswith('_80_Hyperspectral_Images.tif'):            
+                for j in targets:
+                    if j.endswith('_80_Hyperspectral_Images.tif'):
+                        dfX = Read_single_HSI(HSI_dir + '/' + i)
+                        dfY = Read_single_ref(targets_dir + '/' + j)
+                        dfZ = pd.concat([dfX, dfY], axis=1)
+                        df = df.append(dfZ, ignore_index=True)
+            else:            
+                for j in targets:
+                    if j.endswith('_100_Hyperspectral_Images.tif'):
+                        dfX = Read_single_HSI(HSI_dir + '/' + i)
+                        dfY = Read_single_ref(targets_dir + '/' + j)
+                        dfZ = pd.concat([dfX, dfY], axis=1)
+                        df = df.append(dfZ, ignore_index=True)
+    return df
+
+def Combine_folders_CAB(HSI_folder_dir, targets_folder_dir):
+    HSI_folder = os.listdir(HSI_folder_dir)
+    targets_folder = os.listdir(targets_folder_dir)
+    df = pd.DataFrame()
+    CAB = 40
+    for i in HSI_folder:
+        for j in targets_folder:
+            if j == (i + '_classified'):
+                dfA = Combine_CAB((HSI_folder_dir + '/' + i), (targets_folder_dir + '/' + j), CAB)
+                df = df.append(dfA, ignore_index=True)
+    return df
+
+#HSI_folder_dir = 'F:/Trees_classification/Trees_training'
+#targets_folder_dir = 'F:/Trees_classification/Individual_trees_classified'
+#dfX = Combine_folders_CAB(HSI_folder_dir, targets_folder_dir)             
+#Save_csv(dfX, 'trees_CAB_40')
+
+#dfX = pd.read_csv('F:/Trees_classification/trees_CAB_40.csv')
+#model = ANN_Train_Neural_Network(dfX)
+#Save_model(model, 'trained_ANN_CAB_40')
+
+model = Load_model('F:/Trees_classification/trained_ANN_CAB_40.sav')
+test_dir = 'F:/Trees_classification/Trees_testing/'
+target_dir = 'F:/Trees_classification/Individual_trees_classified/'
+CAB = 40
+SKYL = [20]
+for i in os.listdir(test_dir):
+    for j in os.listdir(test_dir + i):
+        if fnmatch.fnmatch(j, '*Cab_' + str(CAB) + '*'):
+            if j.endswith('_0_Hyperspectral_Images.tif'):
+                for k in os.listdir(target_dir + i + '_classified'):
+                    if k.endswith('_0_Hyperspectral_Images.tif'):
+                        Generate_class_img(target_dir + i + '_classified' + '/' +k)
+                        dfA = Read_single_HSI(test_dir + i + '/' +j)
+                        dfB = ANN_Predict_Features_auto(dfA, model)
+                        print ('Automatically classified:')
+                        Generate_class_img_df(dfB)
+            
+
+
+
